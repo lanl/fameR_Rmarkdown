@@ -2,7 +2,7 @@
 A reproducible R pipeline for end‑to‑end processing of GC‑FID fatty acid methyl ester (FAME) datasets. This workflow automates cleaning, calibration, quantification, metadata integration, QC checks, and visualization producing tidy, analysis‑ready outputs with minimal manual intervention
 
 # Key Features
-- Automated import and cleaning of ChemStation GC‑FID integration reports  
+- Automated import and cleaning of ChemStation (or other GC data analysis platforms) GC‑FID integration reports  
 - Calibration‑level mapping and extraction of slopes, intercepts, and R² values  
 - Quantification of calibrated and surrogate‑calibrated compounds  
 - Integration with experimental metadata  
