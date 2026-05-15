@@ -61,6 +61,6 @@ Generated outputs include:
 - Expected outputs
 
 ## Publication/Citation
-The R pipeline was approved for public release by the Richard Feynman Center for Innovation (FCI) at Los Alamos National Laboratory (LANL) under LANL O-number: **Place holder for O number**.
+The R pipeline was approved for public release by the Richard P. Feynman Center for Innovation (FCI) at Los Alamos National Laboratory (LANL) under LANL O-number: **Place holder for O number**.
 
 If this pipeline contributes to your work, please cite **Placeholder for publication**.
