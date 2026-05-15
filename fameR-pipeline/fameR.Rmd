@@ -1,0 +1,1000 @@
+---
+title: "fameR_Rmarkdown"
+author: "FAE"
+date: "2026-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+**Notes for GitHub users:**
+
+If you cloned this repository, you can **knit this R Markdown file exactly as it is** to run the complete pipeline using the **example dataset included in the repo**.
+
+The example output will be generated inside the `example_output/` folder.
+
+Make sure the `fameR.Rmd` file is opened inside the **`fameR_Rmarkdown.Rproj`** so that relative paths resolve correctly.
+
+We aim to convert this pipeline into an R package in the near future.
+
+
+```{r libraries}
+library(tidyverse)
+library(readxl)
+library(stringr)
+library(ggpmisc)
+library(openxlsx)
+library(tools)
+library(writexl)
+library(ggpubr)
+library(rstatix)
+library(scales)
+```
+
+
+# FUNCTIONS (Not intended for user modification - unless necessary)*
+
+Clean - Function for initial cleaning unformatted GC-FID data:
+```{r message=FALSE, warning=FALSE, include=FALSE}
+Clean <- function(RAWDATA) {
+  #Clean line breaks in column names
+  names(RAWDATA) <- gsub("[\r\n]+","", names(RAWDATA))
+  
+  #Clean line breaks from all character columns
+  RAWDATA[] <- lapply(RAWDATA, function(col) {
+    if (is.character(col)) {
+      gsub("[\r\n]+","", col)
+    } else {
+      col
+    }
+  })
+  
+  names(RAWDATA)[names(RAWDATA) == "Sample Description"] <- "Experiment_ID"
+  
+  return(RAWDATA)
+}
+```
+
+ProcessGCFiles - Function to import GC-FID data in one folder (uses Clean function):
+```{r message=FALSE, warning=FALSE, include=FALSE}
+ProcessGCFiles <- function(folder_path, verbose = TRUE) {
+  # List all Excel files in the folder
+  GCFID_files <- list.files(folder_path, pattern = "\\.XLSX$", full.names = TRUE, ignore.case = TRUE)
+  
+  # Internal function to process each file
+  process_fame_file <- function(path) {
+    sequence_id <- tools::file_path_sans_ext(basename(path))
+    name <- paste0(sequence_id, "_i")
+    
+    if (verbose) message(paste("📥 Imported GC-FID run:", sequence_id))
+    
+    tryCatch({
+      RAWDATA <- readxl::read_excel(path, sheet = "Page 2", n_max = 2000)
+      cleaned_data <- Clean(RAWDATA) %>%
+        dplyr::rename(Compound = Name) %>%  # Rename 'Name' to 'Compound'
+        dplyr::mutate(Sequence_ID = sequence_id)
+      setNames(list(cleaned_data), name)
+    }, error = function(e) {
+      message(paste("❌ Failed to import:", sequence_id, "-", e$message))
+      NULL
+    })
+  }
+  
+  # Apply to all files and flatten into a named list
+  purrr::map(GCFID_files, process_fame_file) %>% purrr::compact() %>% purrr::flatten()
+}
+```
+
+GenerateLevelMap - Function to map the names of standard samples for each Sequence_ID
+```{r}
+GenerateLevelMaps <- function(GCFID_Results, cal_path, verbose = TRUE) {
+  # Get all unique Sequence_IDs from the list of tibbles
+  sequence_ids <- unique(unlist(lapply(GCFID_Results, function(df) unique(df$Sequence_ID))))
+  
+  # Initialize storage
+  level_maps <- list()
+  level_maps_df <- list()
+  
+  # Extract level maps for each Sequence_ID
+  for (seq_id in sequence_ids) {
+    raw_levels <- suppressMessages(
+      readxl::read_excel(
+        path = cal_path,
+        sheet = seq_id,
+        range = "D13:M13",
+        col_names = FALSE
+    ))
+    
+    level_ids <- unlist(raw_levels)
+    level_ids <- level_ids[!is.na(level_ids) & level_ids != ""]
+    
+    level_map <- setNames(
+      paste0("Level", seq_along(level_ids), " [mg/L]"),
+      level_ids
+    )
+    
+    level_maps[[seq_id]] <- level_map
+    
+    # Build tidy summary for this sequence
+    level_maps_df[[seq_id]] <- tibble::tibble(
+      Sequence_ID = seq_id,
+      Standard_ID = level_ids,
+      Level_Label = level_map
+    )
+    
+    # Verbose output
+    if (verbose) {
+      cat(paste0("\n📘 Sequence_ID: ", seq_id, "\n"))
+      cat("🧪 Standards found: ", paste(level_ids, collapse = ", "), "\n")
+    }
+  }
+  
+  # Combine all summaries into one tidy data frame
+  level_maps_df <- dplyr::bind_rows(level_maps_df)
+
+  # Return both the list and the summary table
+  return(list(
+    maps = level_maps,
+    summary = level_maps_df
+  ))
+}
+```
+
+ImportCalibrationMatrix - Function to import all the external calibrants information based on unique Sequence_IDs taken from the calibrants Level maps
+```{r message=FALSE, warning=FALSE, include=FALSE}
+
+ImportCalibrationMatrix <- function(cal_path, GCFID_LevelMaps, verbose = TRUE) {
+  sequence_ids <- names(GCFID_LevelMaps)
+  all_cal_data <- list()
+  
+  for (seq_id in sequence_ids) {
+    if (verbose) cat(paste0("\n📘 Processing calibration for Sequence_ID: ", seq_id, "\n"))
+    
+    # Step 1: Read header row (row 13) to get actual standard IDs
+    header_row <- suppressMessages(suppressWarnings(
+      readxl::read_excel(
+        path = cal_path,
+        sheet = seq_id,
+        range = "D13:M13",
+        col_names = FALSE
+      )
+    ))
+    
+    std_ids <- unlist(header_row)
+    std_ids <- std_ids[!is.na(std_ids) & std_ids != ""]
+    
+    # Step 2: Read full calibration matrix (row 14 onward)
+    cal_data <- suppressMessages(suppressWarnings(
+      readxl::read_excel(
+        path = cal_path,
+        sheet = seq_id,
+        range = "A14:M100",
+        col_names = FALSE
+      )
+    ))
+    
+    # Extract compound names from column A
+    compounds <- cal_data[[1]]
+    
+    # Extract only the columns that match named standards
+    all_conc_cols <- cal_data[, 4:(3 + ncol(header_row))]
+    
+    # Identify which columns correspond to named standards
+    named_col_indices <- which(!is.na(header_row) & header_row != "")
+    conc_matrix <- all_conc_cols[, named_col_indices]
+    
+    # Assign correct column names
+    colnames(conc_matrix) <- std_ids
+    
+    # Get level labels from level map
+    level_labels <- GCFID_LevelMaps[[seq_id]]
+    
+    # Build tidy table
+    cal_tidy <- tidyr::pivot_longer(
+      dplyr::bind_cols(Compound = compounds, conc_matrix),
+      cols = -Compound,
+      names_to = "Sample Name",
+      values_to = "Concentration"
+    ) %>%
+      dplyr::mutate(
+        Sequence_ID = seq_id,
+        Level_Label = level_labels[`Sample Name`]
+      ) %>%
+      dplyr::filter(!is.na(Concentration) & !is.na(Compound))
+    
+    all_cal_data[[seq_id]] <- cal_tidy
+  }
+  
+  # Combine all into one data frame
+  dplyr::bind_rows(all_cal_data)
+}
+
+```
+
+AttachGCResultsToCalibration
+```{r}
+
+AttachGCResultsToCalibration <- function(GC_calibration, GC_results, IS_name = "C13:0 ISMethyltridecanoate", verbose = TRUE) {
+  updated_cal <- GC_calibration %>%
+    dplyr::group_split(Sequence_ID) %>%
+    purrr::map_dfr(function(cal_group) {
+      seq_id <- unique(cal_group$Sequence_ID)
+      
+      # Match GC_results element by partial Sequence_ID
+      matched_name <- names(GC_results)[stringr::str_detect(names(GC_results), fixed(seq_id))]
+      gc_data <- if (length(matched_name) == 1) GC_results[[matched_name]] else NULL
+      
+      if (is.null(gc_data)) {
+        if (verbose) cat(paste0("⚠️ No GC-FID data found for Sequence_ID: ", seq_id, "\n"))
+        return(cal_group)
+      }
+      
+      # Rename for clarity
+      gc_data <- gc_data %>% dplyr::rename(Compound = Compound)  # Just in case
+      
+      # Join calibration with GC-FID areas by Sample Name and Compound
+      cal_with_area <- dplyr::left_join(
+        cal_group,
+        gc_data %>% dplyr::select(`Sample Name`, Compound, Area),
+        by = c("Sample Name", "Compound")
+      )
+      
+      # Extract IS areas per Sample Name
+      IS_areas <- gc_data %>%
+        dplyr::filter(Compound == IS_name) %>%
+        dplyr::select(`Sample Name`, IS_Area = Area)
+      
+      # Join IS areas to calibration data
+      cal_with_area <- dplyr::left_join(
+        cal_with_area,
+        IS_areas,
+        by = "Sample Name"
+      )
+      if (verbose) {
+        if (nrow(IS_areas) > 0) {
+          cat(paste0("\n🧪 Found IS areas for ", nrow(IS_areas), " samples and standards in Sequence_ID: ", seq_id, "\n"))
+        } else {
+          cat(paste0("⚠️ Internal Standard '", IS_name, "' not found in Sequence_ID: ", seq_id, "\n"))
+        }
+      }
+      
+      return(cal_with_area)
+    })
+  
+  return(updated_cal)
+}
+```
+
+
+# GENERAL INSTRUCTIONS FOR NEW DATA PROCESSING
+
+1) Acquire and fill-out all the data file templates (GC-FID report template, Metadata template, FAME standard template, and Quantification rules template - The easiest way would be to modify the example datasets). Ask questions to Fuad (fuadale@lanl.gov) or relevant point of contact.
+
+
+2) If not running with example data from the GitHub repo, make sure you have four items in your computer ready to import:
+
+    a) GC-FID integration reports exported from ChemStation (or equivalent GC-FID report template). These files should be all in a single folder and named EXACTLY after the "Sequence_ID" column in the Sample metadata information file. Note that if the correct template was used, these files have to also contain a column with "Experiment_ID" which should exactly match the "Experiment_ID" column in the Sample metadata information file.
+    
+    b) Sample metadata information file with the weight of the samples and relevant experimental information (use the FAME meta.xlsx template). Please note that this version of fameR does not handle analytical replicates (for example; samples that were injected multiple times in the GC instrument or that received the same Injection_ID).
+    
+    c) Updated full profile of external standards (use FAME standard levels.xlsx template) with an additional sheet specifying the relationships between the compound names as exported in the GC reports (often short or not very good looking names) and the desired labels as intended to be shown in your output dataset and plots. Note that this pipeline follows common analytical chemistry practices for quantification using an internal standard and won't work well if the data was collected in conditions that don't follow these common practices. If your GC runs did not include an internal standard, this pipeline needs to be modified to conduct only external calibration.
+    
+    d) OPTIONAL BUT ENCOURAGED: If you conducted identification on GC-MS and/or have quantification rules for uncalibrated compounds, you will need a Quantification rules file that states the surrogate external standard compounds which response factor will be used to calculate the amount of each uncalibrated compound. Note that the best approach for this is to have the uncalibrated peaks identified in ChemStation (or equivalent chromatography data acquisition software), in such a way that they already appear as identified uncalibrated peaks in the GC-FID integration reports. In the example data the uncalibrated peaks are marked with (MS) at the end of the compound names. The surrogate peaks selection for quantification of uncalibrated compounds in the example set already follow standard rules based on structural similarity (https://docs.nrel.gov/docs/fy16osti/60958.pdf). The same rules are recommended for other cases.
+
+
+3) All the user inputs that need to be updated each time that this pipeline is newly set-up are indicated with empty brackets [  ]. Once you have made the input and are sure everything is correct place an X in between the brackets [ X ] to keep control of what parts of the user inputs are already fulfilled.
+
+
+4) Run once all the chunks above to make sure that all functions are defined and all libraries are loaded. Make sure to install any missing packages.
+
+
+5) Provide the location of the folder containing the GC-FID integration report on **user_ReportGC** (don't forget to run the chunk). Leave as is if you cloned the GitHub repo and you are working with the provided example data:
+
+USER INPUT [  ] 
+```{r}
+#USER INPUT
+user_ReportsGC <- "your path to GC-FID reports folder..."
+
+
+
+# Default path for users who cloned the GitHub repo and are working with example data
+default_path <- file.path(getwd(), "example_data", "GC reports")
+
+# Uses user path ONLY if the folder exists; otherwise, falls back to the example data
+GCFID_data_path <- if (dir.exists(user_ReportsGC)) {
+  user_ReportsGC
+} else {
+  message("Using example GC-FID data bundled with the fameR GitHub repository.")
+  default_path
+}
+
+GCFID_data_path
+```
+
+
+6) Provide the location of the file containing all the calibrants information **user_calibration_path**, this file has one tab per Sequence_ID. Update the quantification rules for uncalibrated FAME **user_quant_path**. Don't forget to add the file extensions. It is highly recommended to use the example files as templates. Leave as is if you cloned the GitHub repo and you are working with the provided example data:
+
+USER INPUT [  ]
+```{r}
+#USER INPUT
+user_calibration_path <- "your path to calibration information spreadsheet... use of example template highly recommended... .xslx"
+user_calibration_path_labelssheet <- "name of your labels sheet..."
+
+user_quant_path       <- "your path to quantification rules spreadsheet... use of example template highly recommended... .xslx"
+user_quant_path_sheet <- "name of your rules sheet..."
+
+
+
+# Default path for users who cloned the GitHub repo and are working with example data
+default_calibration_path <- file.path(getwd(), "example_data", "FAME standard levels.xlsx")
+default_calibration_path_labelssheet <- "Labels"
+
+default_quant_path       <- file.path(getwd(), "example_data", "Uncalibrated.xlsx")
+default_quant_path_sheet <- "Rules"
+
+# Uses user paths ONLY if the files exist; otherwise, falls back to the example data
+GCFID_calibration_path <- if (file.exists(user_calibration_path)) {
+  user_calibration_path
+} else {
+  message("Using example calibration data bundled with the fameR GitHub repository.")
+  default_calibration_path
+}
+
+Compounds_labels_sheet <- if (file.exists(user_calibration_path)) {
+  user_calibration_path_labelssheet
+} else {
+  default_calibration_path_labelssheet
+}
+
+GCFID_quant_path <- if (file.exists(user_quant_path)) {
+  user_quant_path
+} else {
+  message("Using example quantification rules bundled with the fameR GitHub repository.")
+  default_quant_path
+}
+
+GCFID_quant_sheet <- if (file.exists(user_quant_path)) {
+  user_quant_path_sheet
+} else {
+  default_quant_path_sheet
+}
+```
+
+
+7) Update the location of the file containing all the experiments metadata (use of example template highly recommended). Leave as is if you cloned the GitHub repo and you are working with the provided example data:
+
+USER INPUTS [  ]
+```{r}
+#USER INPUT
+user_meta_path <- "your path to metadata samples information spreadsheet... use of example template highly recommended... .xslx"
+user_meta_path_sheet <- "name of your metadata sheet..."
+
+
+
+# Default path for users who cloned the GitHub repo and are working with example data
+default_meta_path <- file.path(getwd(), "example_data", "FAME meta.xlsx")
+default_meta_path_sheet <- "FAME Meta"
+
+# Uses user paths ONLY if the files exist; otherwise, falls back to the example data
+GCFID_meta_path <- if (file.exists(user_meta_path)) {
+  user_meta_path
+} else {
+  message("Using example metadata bundled with the fameR GitHub repository.")
+  default_meta_path
+}
+
+GCFID_meta_path_sheet <- if (file.exists(user_meta_path)) {
+  user_meta_path_ssheet
+} else {
+  default_meta_path_sheet
+}
+```
+
+
+8) Update the location of the folder where you want your exported results to go. Leave as is if you cloned the GitHub repo and you are working with the provided example data:
+
+USER INPUTS [X]
+```{r}
+#USER INPUT: Define the export directory
+user_export_dir <- "your export directory folder..."
+
+
+
+# Default path for users who cloned the GitHub repo and are working with example data
+default_export_dir <- file.path(getwd(), "example_output")
+
+invalid_user_dir <- (
+  is.null(user_export_dir) ||
+  user_export_dir == "" ||
+  grepl("your export directory folder", user_export_dir, ignore.case = TRUE) ||
+  !dir.exists(dirname(user_export_dir))
+)
+
+# If the user directory is usable, uses it; otherwise falls back to example_output
+if (invalid_user_dir) {
+  message("Using example output directory included in the GitHub repository.")
+  Export_dir <- default_export_dir
+} else {
+  Export_dir <- user_export_dir
+}
+
+# ---- ENSURE DIRECTORY EXISTS ----
+if (!dir.exists(Export_dir)) {
+  dir.create(Export_dir, recursive = TRUE)
+  message("📁 Created export folder: ", Export_dir)
+} else {
+  message("📁 Export folder already exists: ", Export_dir)
+}
+
+Export_dir
+```
+
+
+9) Run the chunks below one by one, paying attention to any errors or alerts, if any pops ask Fuad.
+
+
+# IMPORTING RAW DATA AND INITIAL CLEANING
+
+## Importing GC-FID results
+```{r}
+
+if (length(setdiff(list.files(GCFID_data_path, pattern = "(?i)\\.xlsx$", full.names = TRUE),
+                   list.files(GCFID_data_path, pattern = "~\\$", full.names = TRUE))) == 0) {
+  message("⚠️ No Excel files found in the folder.")
+} else {
+  GCFID_Results <- ProcessGCFiles(GCFID_data_path)
+}
+
+
+#View(GCFID_Results)
+```
+
+## Importing Metadata and calibrant identifiers
+```{r}
+#Importing metadata
+GCFID_meta <- read_excel(GCFID_meta_path, 
+    sheet = GCFID_meta_path_sheet, range = "A2:P20000", 
+    na = "NA")
+
+#Mapping the standard levels in each run
+GCFID_Levels <- GenerateLevelMaps(GCFID_Results, cal_path = GCFID_calibration_path)
+GCFID_Levels_map <- GCFID_Levels$maps
+GCFID_Levels_df <- GCFID_Levels$summary
+```
+
+## Importing External calibrations and matching with internal standard
+```{r}
+GCFID_calibration <- ImportCalibrationMatrix(cal_path = GCFID_calibration_path, GCFID_LevelMaps = GCFID_Levels_map)
+
+GCFID_calibration <- AttachGCResultsToCalibration(GC_calibration = GCFID_calibration, GC_results = GCFID_Results)
+
+```
+
+## Importing quantification rules for uncalibrated compounds & label rules
+```{r}
+# Import and clean quantification rules
+GCFID_quant <- read_excel(
+  GCFID_quant_path, 
+  sheet = GCFID_quant_sheet, 
+  range = "A1:C100", 
+  na = "NA"
+) %>%
+  na.omit()
+
+# Check if data was imported
+if (!is.null(GCFID_quant) && nrow(GCFID_quant) > 0) {
+  message("✅ Quantification rules imported successfully: ", nrow(GCFID_quant), " uncalibrated compounds")
+  
+  # Identify included compounds
+  included <- GCFID_quant %>%
+    filter(tolower(Exclude) != "yes") %>%
+    pull(Compound)
+  
+  if (length(included) > 0) {
+    message("✅ ", length(included), " compounds will be included for quantification:")
+    message("   • ", paste(included, collapse = "\n   • "))
+  } else {
+    message("⚠️ No compounds available for quantification. All are marked for exclusion.")
+  }
+  
+} else {
+  message("⚠️ Quantification rules not imported or empty. If you indend to quantify uncalibrated compounds, please check the file path and sheet name")
+}
+
+# Import label rules
+GCFID_labels <- read_excel(
+  GCFID_calibration_path,
+  sheet = Compounds_labels_sheet,
+  range = "A1:B100",
+  na = "NA"
+) %>%
+  na.omit()
+```
+
+
+
+# CALIBRATION CURVES
+
+## Calculating Area ratios in calibration table for each Sequence_ID
+```{r}
+GCFID_calibration <- GCFID_calibration %>%
+  mutate(
+    Area_ratio = Area / IS_Area
+  )
+```
+
+
+## (OPTIONAL) Adding (0,0) points
+```{r}
+zero_points <- GCFID_calibration %>%
+  ungroup() %>%
+  distinct(Sequence_ID, Compound) %>%
+  mutate(
+    Area = 0,
+    IS_Area = NA,
+    Concentration = 0,
+    Level_Label = "Level0 [mg/L]",
+    Area_ratio = 0
+  )
+
+
+GCFID_calibration <- GCFID_calibration %>%
+  group_by(Sequence_ID, Compound) %>%
+  bind_rows(zero_points) %>%
+  ungroup()
+  
+```
+
+
+## Creating and exporting calibration curves
+Once the calibration curves are exported, examine them and update the calibration file if you decide to remove any of the standard levels (Aim for near 0.999 R2). Once updated re Run All Chunks Above.
+USER INPUT [x]
+```{r warning=FALSE}
+# Loop through each Sequence_ID and generate a plot
+unique_sequences <- unique(GCFID_calibration$Sequence_ID)
+
+for (seq_id in unique_sequences) {
+  # Filter data for this sequence
+  seq_data <- GCFID_calibration %>% filter(Sequence_ID == seq_id)
+  
+  # Create the plot
+  seq_plot <- ggplot(seq_data, aes(x = Concentration, y = Area_ratio)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE, color = "blue") +
+    
+    # Equation in top-left
+    stat_poly_eq(
+      aes(label = ..eq.label..),
+      formula = y ~ x,
+      parse = TRUE,
+      size = 2,
+      label.x.npc = "left",
+      label.y.npc = "top"
+    ) +
+    
+    # R² in bottom-right
+    stat_poly_eq(
+      aes(label = ..rr.label..),
+      formula = y ~ x,
+      parse = TRUE,
+      size = 3,
+      label.x.npc = "right",
+      label.y.npc = "bottom",
+      vjust = 4.5,
+      hjust = -1,
+      rr.digits = 3
+    ) +
+    
+    facet_wrap(~ Compound, scales = "free") +
+    theme_minimal(base_size = 12) +
+    theme(
+      strip.text = element_text(size = 6.5, hjust = 1)  # Smaller, right-aligned facet labels
+    ) +
+    labs(
+      title = paste("GC-FID Calibration Curves -", seq_id),
+      x = "Concentration",
+      y = "Area Ratio"
+    )
+  
+  # Export the plot
+  ggsave(
+    filename = file.path(Export_dir, paste0("GC_calibration_", seq_id, ".jpeg")),
+    plot = seq_plot,
+    width = 11,
+    height = 7,
+    dpi = 300
+  )
+  
+  print(paste0("📤 Exported calibration curves plot for Sequence_ID: ", seq_id))
+}
+
+```
+
+## Extracting calibration parameters (internal calibration)
+```{r}
+#Fit models per Sequence_ID and Compound
+model_df <- GCFID_calibration %>%
+  group_by(Sequence_ID, Compound) %>%
+  summarise(
+    model = list(lm(Area_ratio ~ Concentration, data = pick(Area_ratio, Concentration))),
+    .groups = "drop"
+  )
+
+#Extract slope, intercept, and R²
+calibration_params <- model_df %>%
+  mutate(
+    Slope = map_dbl(model, ~ coef(.x)[["Concentration"]]),
+    Intercept = map_dbl(model, ~ coef(.x)[["(Intercept)"]]),
+    R_squared = map_dbl(model, ~ summary(.x)$r.squared)
+  ) %>%
+  select(Sequence_ID, Compound, Slope, Intercept, R_squared) %>%
+  filter(!is.na(Slope))
+```
+
+
+# QUANTIFICATION OF ANALYTES
+
+## Calculating Area ratios in samples
+```{r}
+GCFID_Results_filtered <- map(GCFID_Results, function(df) {
+  df_filtered <- df %>%
+    semi_join(GCFID_meta, by = c(
+      "Sequence_ID" = "Sequence_ID",
+      "Experiment_ID" = "Experiment_ID",
+      "Sample Name" = "Injection_ID"
+    ))
+
+  IS_values <- df_filtered %>%
+    filter(Compound == "C13:0 ISMethyltridecanoate") %>%
+    select(`Sample Name`, IS_Area = Area)
+
+  df_filtered %>%
+    left_join(IS_values, by = "Sample Name") %>%
+    mutate(Area_ratio = Area / IS_Area) %>%
+    filter(Compound != "C13:0 ISMethyltridecanoate")
+})
+```
+
+
+## Calculating concentrations for calibrated compounds
+```{r}
+GCFID_Results_calibrated <- map(GCFID_Results_filtered, function(df) {
+  df %>%
+    left_join(calibration_params, by = c("Compound", "Sequence_ID")) %>%
+    mutate(Concentration_mgperL = (Area_ratio - Intercept) / Slope)
+})
+```
+
+
+## Calculating concentrations for uncalibrated compounds
+```{r}
+GCFID_Results_uncalibrated <- map(GCFID_Results_calibrated, function(df) {
+  # Build surrogate calibration look up
+  surrogate_params <- df %>%
+    select(Compound, Sequence_ID) %>%
+    distinct() %>%
+    left_join(GCFID_quant, by = "Compound") %>%
+    filter(!is.na(Response_surrogate)) %>%
+    left_join(calibration_params, by = c("Response_surrogate" = "Compound", "Sequence_ID" = "Sequence_ID")) %>%
+    select(Compound, Sequence_ID, Response_surrogate, Slope_surrogate = Slope, Intercept_surrogate = Intercept)
+
+  # Apply surrogate calibration and retain slope/intercept
+  df %>%
+    left_join(surrogate_params, by = c("Compound", "Sequence_ID")) %>%
+    mutate(
+      Concentration_surrogate = (Area_ratio - Intercept_surrogate) / Slope_surrogate,
+      Concentration_mgperL = if_else(
+        is.na(Concentration_mgperL) | Concentration_mgperL == 0,
+        Concentration_surrogate,
+        Concentration_mgperL
+      ),
+      Concentration_mgperL = if_else(Concentration_mgperL < 0 | is.na(Concentration_mgperL), 0, Concentration_mgperL)
+    )
+})
+```
+
+
+## Excluding flagged compounds
+```{r}
+GCFID_Results_uncalibrated <- map(GCFID_Results_uncalibrated, function(df) {
+  excluded_compounds <- GCFID_quant %>%
+    filter(Exclude == "Yes") %>%
+    pull(Compound)
+
+  df %>%
+    filter(!Compound %in% excluded_compounds)
+})
+```
+
+
+## Joining results to Metadata, discard calibration information
+Concentrations are in mgperL of hexane
+```{r}
+GCFID_Results_tidy <- map(GCFID_Results_uncalibrated, function(df) {
+  df %>%
+    select(
+      Sequence_ID, Experiment_ID, `Sample Name`, Compound,
+      Concentration_mgperL
+    ) %>%
+    pivot_wider(
+      names_from = Compound,
+      values_from = Concentration_mgperL,
+      names_prefix = "Conc_"
+    )
+})
+
+# Now join each tidy result to GCFID_meta
+GCFID_Results_tidy <- map(GCFID_Results_tidy, function(df) {
+  df %>%
+    left_join(GCFID_meta, by = c(
+      "Sequence_ID" = "Sequence_ID",
+      "Experiment_ID" = "Experiment_ID",
+      "Sample Name" = "Injection_ID"
+    ))
+})
+
+# NA are treated like 0
+GCFID_Results_tidy <- map(GCFID_Results_tidy, function(df) {
+  df %>%
+    mutate(across(starts_with("Conc_"), ~replace_na(.x, 0)))
+})
+```
+
+
+## Calculating proportion of each compound and total FAME (g/dry g biomass)
+```{r}
+GCFID_Results_final <- map(GCFID_Results_tidy, function(df) {
+  df %>%
+    mutate(
+      Total_FAME_mgperL = rowSums(select(., starts_with("Conc_")), na.rm = TRUE),
+      Total_FAME_mg = Total_FAME_mgperL * ExtractantUsed_mL/1000,
+      Total_FAME_g_per_g_biomass = Total_FAME_mg / (InitialSampleMass_mg)
+    ) %>%
+    mutate(across(starts_with("Conc_"), ~ .x / Total_FAME_mgperL, .names = "Prop_{.col}"))
+})
+
+GCFID_Results_all <- bind_rows(GCFID_Results_final)
+```
+
+
+# CLEAN-UP & EXPORT
+
+## Selecting only important columns and giving more appealing compound names
+STOP AT THIS POINT AND CHECK THE QCs if you want by running **View(GCFID_Results_all_neat)** in the console
+```{r}
+
+# Get all proportion columns
+prop_cols <- names(GCFID_Results_all)[startsWith(names(GCFID_Results_all), "Prop_Conc_")]
+
+# Extract the suffix from each column name
+prop_suffixes <- sub("^Prop_Conc_", "", prop_cols)
+
+# Create a data frame to match suffixes to clean labels
+rename_df <- data.frame(
+  original_col = prop_cols,
+  FAME_ID = prop_suffixes,
+  stringsAsFactors = FALSE
+)
+
+# Join with GCFID_labels to get clean names
+rename_df <- merge(rename_df, GCFID_labels, by = "FAME_ID", all.x = TRUE)
+
+# Create renaming vector
+prop_rename_vector <- setNames(rename_df$FAME_label, rename_df$original_col)
+
+# Select metadata, total FAME, and proportion columns
+meta_cols <- c("Sequence_ID", "Experiment_ID", "Sample Name", "Sample_ID", 
+               "Date_Collected", "KineticTime_d", "Reactor_ID", "Source", 
+               "Block", "Date_analyzed", "Vial_tag", 
+               "Total_FAME_g_per_g_biomass")
+
+GCFID_Results_all_neat <- GCFID_Results_all[, c(meta_cols, prop_cols)]
+
+# Rename proportion columns to clean FAME labels
+names(GCFID_Results_all_neat)[names(GCFID_Results_all_neat) %in% names(prop_rename_vector)] <- 
+  prop_rename_vector[names(GCFID_Results_all_neat)[names(GCFID_Results_all_neat) %in% names(prop_rename_vector)]]
+
+# Replace NA with 0 in all proportion columns
+prop_labels <- rename_df$FAME_label  # these are the new column names
+GCFID_Results_all_neat[, prop_labels] <- lapply(
+  GCFID_Results_all_neat[, prop_labels],
+  function(x) ifelse(is.na(x), 0, x)
+)
+
+# Adjust dates format
+GCFID_Results_all_neat <- GCFID_Results_all_neat %>%
+  mutate(
+    Date_Collected = as.Date(Date_Collected),
+    Date_analyzed = as.Date(Date_analyzed)
+  )
+```
+
+
+## Ordering, final check-up, clean-up, and export tidy dataset
+Some alerts will be displayed here for  obvious issues in certain samples
+[  ]USER INPUT (Type TRUE or FALSE for the variable DISCARD below). TRUE will discard flagged samples based on:
+ 1) FAME content higher than 100% (this is due to a problem when adding IS during the transesterification procedure)
+ 2) Methyl palmitate (C16:0) percentage of total FAME lower than 1 % (this signals a cultivation or sample prep outlier)
+```{r}
+
+# USER: DO YOU WANT TO DISCARD FLAGGED SAMPLES?
+DISCARD <- TRUE
+
+
+
+
+# Clean and reorder dataset
+GCFID_Results_all_neat <- GCFID_Results_all_neat %>%
+  rename(Injection_ID = `Sample Name`) %>%
+  select(-Source, -Vial_tag) %>%
+  select(Experiment_ID, Sequence_ID, Injection_ID, Sample_ID, Date_Collected, Date_analyzed, 
+         Reactor_ID, KineticTime_d, Block, Total_FAME_g_per_g_biomass, everything()) %>%
+  filter(Block != "QC")
+
+# Define FAME columns (starting from column 10 onward)
+fame_columns <- names(GCFID_Results_all_neat)[10:length(names(GCFID_Results_all_neat))]
+
+# Identify samples with issues
+fame_issue <- GCFID_Results_all_neat %>%
+  filter(Total_FAME_g_per_g_biomass > 1)
+
+cultivation_issue <- GCFID_Results_all_neat %>%
+  filter(`Methyl palmitate (C16:0)` < 0.005)
+
+# Combine all flagged samples by Sample_ID and Experiment_ID
+flagged_samples <- bind_rows(fame_issue, cultivation_issue) %>%
+  distinct(Sample_ID, Experiment_ID)
+
+# Print warnings
+if (nrow(fame_issue) > 0) {
+  warning(paste0(
+    "⚠️ Internal standard issue detected in ", nrow(fame_issue), " sample(s): ",
+    paste(paste(fame_issue$Sample_ID, fame_issue$Experiment_ID, sep = " (Exp: "), collapse = "), "),
+    ")",
+    "\n"
+  ))
+}
+
+if (nrow(cultivation_issue) > 0) {
+  warning(paste0(
+    "⚠️ Potential cultivation issue detected in ", nrow(cultivation_issue), " sample(s): ",
+    paste(paste(cultivation_issue$Sample_ID, cultivation_issue$Experiment_ID, sep = " (Exp: "), collapse = "), "),
+    ")",
+    "\n"
+  ))
+}
+
+# Create a flag column for samples to discard using both Sample_ID and Experiment_ID
+GCFID_Results_all_neat <- GCFID_Results_all_neat %>%
+  left_join(flagged_samples %>% mutate(flagged = TRUE),
+            by = c("Sample_ID", "Experiment_ID")) %>%
+  mutate(flagged = if_else(is.na(flagged), FALSE, flagged))
+
+# Conditionally replace FAME values with NA
+if (DISCARD) {
+  GCFID_Results_all_neat <- GCFID_Results_all_neat %>%
+    mutate(across(all_of(fame_columns), ~ if_else(flagged, NA_real_, .))) %>%
+    select(-flagged)
+  message("✅ FAME values in flagged samples were replaced with NA.")
+} else {
+  GCFID_Results_all_neat <- GCFID_Results_all_neat %>%
+    select(-flagged)
+  message("ℹ️ Flagged samples and their FAME values were retained.")
+}
+
+```
+
+## Exporting dataset
+```{r}
+# Write the dataset to Excel
+write_xlsx(GCFID_Results_all_neat, file.path(Export_dir, "GCFID_Results_Cleaned.xlsx"))
+message(paste("✅ Cleaned dataset exported to:", file.path(Export_dir, "GCFID_Results_Cleaned.xlsx")))
+```
+
+
+# GENERAL VISUALIZATION
+
+## Total FAME with non-parametric statistical test
+```{r echo=TRUE, message=TRUE, warning=FALSE}
+
+# Perform Kruskal-Wallis test for each Experiment_ID
+kruskal_results <- GCFID_Results_all_neat %>%
+  group_by(Experiment_ID) %>%
+  summarise(
+    kruskal = list(kruskal.test(Total_FAME_g_per_g_biomass ~ Block)),
+    .groups = "drop"
+  )
+
+# Print results for each experiment
+for (i in seq_len(nrow(kruskal_results))) {
+  cat("\nExperiment:", kruskal_results$Experiment_ID[i], "\n")
+  print(kruskal_results$kruskal[[i]])
+}
+
+# Ensure Block is a factor
+GCFID_Results_all_neat$Block <- as.factor(GCFID_Results_all_neat$Block)
+
+# Create faceted boxplot with jitter and p-value bar
+p <- ggplot(GCFID_Results_all_neat, aes(x = Block, y = Total_FAME_g_per_g_biomass, fill = Block)) +
+  geom_boxplot(outlier.shape = NA) +  # Hide outliers so jitter shows clearly
+  geom_jitter(width = 0.2, alpha = 0.6, size = 1.5) +  # Add jittered points
+  theme_minimal() +
+  labs(title = "Total FAME by Block (Faceted by Experiment)",
+       x = "Block",
+       y = "Total FAME (g/g dry biomass)") +
+  theme(legend.position = "none") +
+  facet_wrap(~ Experiment_ID, scales = "free_x") +
+  stat_compare_means(method = "kruskal.test", label = "p.format", 
+                     label.y = max(GCFID_Results_all_neat$Total_FAME_g_per_g_biomass) * 1.05)
+
+print(p)
+
+# Export plot as JPEG to Export_dir
+ggsave(filename = file.path(Export_dir, "Total_FAME_by_Block_Faceted.jpeg"),
+       plot = p,
+       width = 10, height = 6, dpi = 300)
+
+message(paste("✅ Faceted boxplot with jitter exported to:", 
+              file.path(Export_dir, "Total_FAME_by_Block_Faceted.jpeg")))
+
+```
+
+## Plotting the percentage of total FAME
+```{r echo=TRUE}
+
+# Identify FAME columns
+fame_cols <- names(GCFID_Results_all_neat)[11:length(names(GCFID_Results_all_neat))]
+
+# Reshape to long format
+fame_long <- tidyr::pivot_longer(
+  GCFID_Results_all_neat,
+  cols = dplyr::all_of(fame_cols),
+  names_to = "FAME_Type",
+  values_to = "FAME_Percent"
+)
+
+# Compute global median and reorder factor levels explicitly (ascending)
+fame_order <- fame_long %>%
+  group_by(FAME_Type) %>%
+  summarise(median_val = median(FAME_Percent, na.rm = TRUE)) %>%
+  arrange(median_val) %>%   # ascending order
+  pull(FAME_Type)
+
+# Apply this order to the factor
+fame_long$FAME_Type <- factor(fame_long$FAME_Type, levels = fame_order)
+
+# Create the plot
+p <- ggplot(fame_long, aes(x = FAME_Percent, y = FAME_Type, fill = Block)) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.6) +
+  facet_grid(rows = vars(Experiment_ID), scales = "free_y", space = "free_y") +
+  scale_x_continuous(labels = scales::percent_format(scale = 100)) +  # Convert fractions to %
+  theme_bw() +
+  theme(
+    strip.text.y = element_text(angle = 0),
+    axis.text.y = element_text(size = 8),
+    panel.spacing = grid::unit(0.5, "lines")
+  ) +
+  labs(
+    title = "Horizontal Boxplot of FAME% by Experiment_ID (Ordered Ascending by Median Abundance)",
+    x = "Percentage of total FAME",
+    y = "FAME species"
+  )
+
+print(p)
+
+# Export plot
+ggsave(
+  filename = file.path(Export_dir, "Profile_FAME_Boxplot_by_Experiment_Ordered.jpeg"),
+  plot = p,
+  width = 12,
+  height = 22,
+  dpi = 400
+)
+
+message(paste("✅ Ascending ordered FAME% boxplot (with percentage axis) exported to:",
+              file.path(Export_dir, "FAME_Boxplot_by_Experiment_Ordered.jpeg")))
+
+```
