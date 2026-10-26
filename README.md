@@ -1,5 +1,5 @@
 # fameR
-A reproducible R pipeline for end‑to‑end processing of GC‑FID fatty acid methyl ester (FAME) datasets. This workflow automates cleaning, calibration, quantification, metadata integration, QC checks, and visualization producing tidy, analysis‑ready outputs with minimal manual intervention
+A reproducible R pipeline for end‑to‑end processing of GC‑FID fatty acid methyl ester (FAME) datasets. This workflow automates cleaning, calibration, quantification, metadata integration, QC checks, and visualization producing tidy, analysis‑ready outputs with minimal manual intervention. This pipeline was built to keep all data processing steps clear, reproducible, and instrument‑agnostic, so the focus can stay on interpreting the biological data rather than spending time navigating GUI‑based data processing.
 
 # Key Features
 - Automated import and cleaning of ChemStation (or other chromatography data acquisiton software) GC‑FID integration reports
